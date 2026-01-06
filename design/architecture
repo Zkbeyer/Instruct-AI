@@ -1,1 +1,300 @@
+# Architecture
 
+AI Teaching App — Architecture & Technical Design (MVP → Scale)
+
+---
+
+## 0) Purpose
+
+Build an AI tutoring application that feels like a **continuous tutoring relationship**.
+Users can leave and return at any time, and the tutor remembers context, goals, and learning progress.
+
+This document defines:
+- System components and request flows
+- Memory and session continuity strategy
+- Tech stack and library choices
+- Model integration policy
+- Security, observability, and scale path
+- Explicit non-goals (what is intentionally deferred)
+
+---
+
+## 1) High-level architecture
+
+Frontend
+- Next.js (TypeScript)
+- Responsible for UI, session navigation, and streaming responses
+
+Backend
+- FastAPI (Python)
+- Owns authentication, rate limiting, model calls, streaming, persistence, and business logic
+
+Data
+- PostgreSQL (system of record)
+- Redis (cache, rate limiting, ephemeral state)
+
+LLM Provider
+- OpenAI API (streaming enabled)
+
+---
+
+## 2) Component layout (text diagram)
+
+User Browser
+    |
+    v
+Next.js Frontend
+    |
+    |  REST + Server-Sent Events (SSE)
+    v
+FastAPI Backend
+    |           |
+    |           +--> Redis (rate limits, cache, ephemeral state)
+    |
+    +--> PostgreSQL (sessions, messages, summaries, mastery)
+    |
+    +--> OpenAI API (streaming responses)
+
+---
+
+## 3) Core product flows
+
+### 3.1 Start or resume a tutoring session
+
+Goal: Sessions are durable and resumable.
+
+1. Frontend requests the user’s sessions  
+   `GET /v1/sessions`
+
+2. User opens an existing session or creates a new one  
+   `POST /v1/sessions`
+
+3. Backend loads:
+   - session metadata
+   - working memory (summary)
+   - skill/mastery data
+
+4. Frontend renders session context so the tutor “remembers” where things left off
+
+---
+
+### 3.2 Send a message and stream tutor response
+
+Why SSE:
+- Simple
+- Native browser support
+- Ideal for token-by-token streaming
+
+Flow:
+
+1. UI sends a user message  
+   `POST /v1/sessions/{session_id}/messages`
+
+2. Backend:
+   - validates input (Pydantic)
+   - authenticates user
+   - applies rate limiting (Redis)
+   - loads session memory (summary + mastery)
+
+3. Backend calls the LLM with streaming enabled
+
+4. Backend forwards tokens to the client via SSE  
+   `GET /v1/sessions/{session_id}/stream?message_id=...`
+
+5. Backend persists:
+   - final assistant message
+   - token usage
+   - timestamps
+
+6. Backend updates session summary and learning signals
+
+---
+
+## 4) Memory model (session continuity)
+
+The system uses a **DB-first memory strategy**.
+PostgreSQL is the source of truth.
+
+### 4.1 Memory layers
+
+1. Transcript memory (durable)
+- Full conversation history
+- Stored in `messages`
+
+2. Working memory (durable, compact)
+- Rolling session summary:
+  - what has been covered
+  - current learning goals
+  - unresolved questions
+- Stored in `session_state.summary`
+
+3. Skill / mastery memory (durable, structured)
+- Per-topic mastery signals
+- Stored in `skill_mastery`
+
+4. Ephemeral memory (non-durable)
+- Rate limits
+- Short-lived caches
+- Idempotency keys
+- Stored in Redis
+
+---
+
+### 4.2 Prompt context strategy (MVP)
+
+Each model call includes:
+- System tutor instructions
+- Minimal user profile (if available)
+- Session summary (working memory)
+- Last N messages (small sliding window)
+
+The full transcript is **never** sent on every call.
+
+Session summaries are updated incrementally to preserve continuity while controlling cost.
+
+---
+
+## 5) Tech stack
+
+### Frontend
+- Next.js (TypeScript)
+- Native EventSource or fetch-based streaming client
+- Minimal client-side state; backend is authoritative
+
+### Backend
+- FastAPI (Python)
+- Uvicorn (ASGI server)
+- Pydantic (validation)
+- SSE support (e.g., sse-starlette or equivalent)
+- Async HTTP client if needed (httpx)
+
+### Data
+- PostgreSQL (primary database)
+- Redis (rate limiting, caching, ephemeral state)
+
+### LLM integration
+- OpenAI API with streaming
+- All model calls routed through backend only
+
+---
+
+## 6) Model policy (MVP defaults)
+
+Use a **tiered model strategy** for cost and quality control:
+
+- High-quality tutoring responses:
+  - Primary reasoning model
+
+- Utility tasks (summaries, tagging, quiz grading):
+  - Smaller, cheaper model
+
+Rules:
+- Model selection happens only in the backend
+- No client-side model access
+- Usage metrics are logged for observability
+
+---
+
+## 7) Minimal API surface (MVP)
+
+Sessions
+- `POST /v1/sessions` — create session
+- `GET /v1/sessions` — list sessions
+- `GET /v1/sessions/{id}` — get session metadata + summary
+
+Messaging / Streaming
+- `POST /v1/sessions/{id}/messages` — send user message
+- `GET /v1/sessions/{id}/stream?message_id=...` — SSE stream
+- `GET /v1/sessions/{id}/messages` — fetch transcript
+
+Progress
+- `GET /v1/progress/overview`
+- `GET /v1/progress/topics`
+
+Auth (implementation-specific)
+- `POST /v1/auth/login`
+- `POST /v1/auth/logout`
+- `GET /v1/auth/me`
+
+---
+
+## 8) Database schema (MVP)
+
+users
+- id (uuid)
+- email
+- password_hash or external_auth_id
+- created_at
+
+sessions
+- id (uuid)
+- user_id
+- title (optional)
+- created_at
+- updated_at
+
+messages
+- id (uuid)
+- session_id
+- role (user | assistant | system)
+- content
+- token_count
+- created_at
+
+session_state
+- session_id (uuid)
+- summary (text)
+- updated_at
+
+skill_mastery
+- id (uuid)
+- user_id
+- topic
+- confidence_score
+- last_practiced_at
+
+---
+
+## 9) Security considerations
+
+- Authentication required for all session endpoints
+- Rate limiting enforced via Redis
+- Secrets stored in environment variables only
+- All LLM calls originate from backend
+- Minimal logging of user content (privacy-aware)
+
+---
+
+## 10) Observability (from day one)
+
+Track:
+- Request latency (p50 / p95)
+- Model latency
+- Token usage per session
+- Error rates by endpoint
+- Redis hit rates
+
+---
+
+## 11) Explicit non-goals (for MVP)
+
+These are intentionally deferred:
+- LangGraph / complex agent graphs
+- Kafka
+- Kubernetes
+- CMS (Strapi)
+- External vector databases (e.g., Pinecone)
+
+Reason:
+- Avoid premature complexity
+- Focus on shipping a usable tutoring experience first
+
+---
+
+## 12) Future evolution (planned)
+
+- Background workers for summarization and analytics
+- Vector search (pgvector) for retrieval-based tutoring
+- Structured tutoring flows (teach → quiz → adapt)
+- Instructor or curriculum mode
+- Optional agent orchestration framework if complexity demands it
